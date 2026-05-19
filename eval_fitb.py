@@ -8,13 +8,13 @@ from model import OutfitTransformer
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate OutfitTransformer FITB")
-    parser.add_argument("--model_path", type=str, default="outfit_transformer_epoch_3.pt", help="Path to model weights")
+    parser.add_argument("--model_path", type=str, default="outfit_transformer_epoch_11.pt", help="Path to model weights")
     parser.add_argument("--num_layers", type=int, default=4, help="Must match model's num_layers")
     args = parser.parse_args()
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     print(f" Using Device: {device}")
-    
+
     # 1. Load Model
     model = OutfitTransformer(num_layers=args.num_layers).to(device)
     if os.path.exists(args.model_path):
@@ -22,14 +22,7 @@ def main():
         print(f"✅ Loaded weights from {args.model_path}")
     else:
         print(f"⚠️  No checkpoint found at {args.model_path}, using random weights.")
-        
-    # [HOTFIX] Zero out the newly added, UNTRAINED modality embeddings
-    # to evaluate the pure performance of the old weights.
-    with torch.no_grad():
-        if hasattr(model, 'text_type_emb'): model.text_type_emb.zero_()
-        if hasattr(model, 'image_type_emb'): model.image_type_emb.zero_()
-        if hasattr(model, 'mask_token'): model.mask_token.zero_()
-        
+
     model.eval()
     
     # 2. Load Datasets & Build the Translation Maps

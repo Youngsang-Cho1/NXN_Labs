@@ -86,24 +86,47 @@ class OutfitRetrievalDataset(Dataset):
         if not t_cat: t_cat = str(self.items_dataset[t_idx].get("title", "")).lower().strip()
         if not t_cat: t_cat = "unknown"
         
-        # 1. Hard Negative (Same category)
+        # 1. Visual Online Hard Negative Mining
         hard_candidates = self.category_to_item_ids.get(t_cat, [])
-        attempts = 0
-        while len(negative_images) < 1 and attempts < 10:
-            attempts += 1
-            if not hard_candidates: break
-            neg_id = random.choice(hard_candidates)
-            if neg_id not in outfit_items:
+        valid_candidates = [c for c in hard_candidates if c not in outfit_items]
+        
+        # If we have precomputed embeddings, do Visual Hard Negative Mining
+        if self.embeddings_dict is not None and target_item_id in self.embeddings_dict and len(valid_candidates) >= self.num_negatives:
+            # Sample a pool to keep matrix multiplication very fast
+            pool_size = min(100, len(valid_candidates))
+            pool_ids = random.sample(valid_candidates, pool_size)
+            
+            # Fetch embeddings
+            target_emb = self.embeddings_dict[target_item_id]["image"]
+            candidate_embs = torch.stack([self.embeddings_dict[c_id]["image"] for c_id in pool_ids])
+            
+            # Compute Cosine Similarity (vectors are already L2 normalized)
+            sims = torch.matmul(candidate_embs, target_emb)
+            
+            # Pick top-K most visually similar items as the hard negatives!
+            top_k_indices = torch.topk(sims, k=self.num_negatives).indices
+            hard_negative_ids = [pool_ids[i] for i in top_k_indices]
+            
+            for neg_id in hard_negative_ids:
+                img, _ = self._get_item_data(neg_id)
+                negative_images.append(img)
+        else:
+            # Fallback to random category / easy negatives if embeddings not loaded
+            attempts = 0
+            while len(negative_images) < 1 and attempts < 10:
+                attempts += 1
+                if not valid_candidates: break
+                neg_id = random.choice(valid_candidates)
                 img, _ = self._get_item_data(neg_id)
                 negative_images.append(img)
                 break
                 
-        # 2. Easy Negatives (Random pool)
-        while len(negative_images) < self.num_negatives:
-            neg_id = random.choice(self.all_item_ids)
-            if neg_id not in outfit_items:
-                img, _ = self._get_item_data(neg_id)
-                negative_images.append(img)
+            # 2. Easy Negatives (Random pool)
+            while len(negative_images) < self.num_negatives:
+                neg_id = random.choice(self.all_item_ids)
+                if neg_id not in outfit_items:
+                    img, _ = self._get_item_data(neg_id)
+                    negative_images.append(img)
                 
         return {
             "context_images": context_images,
