@@ -10,6 +10,10 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate OutfitTransformer FITB")
     parser.add_argument("--model_path", type=str, default="outfit_transformer_epoch_11.pt", help="Path to model weights")
     parser.add_argument("--num_layers", type=int, default=4, help="Must match model's num_layers")
+    parser.add_argument("--split", type=str, default="nondisjoint",
+                        choices=["nondisjoint", "disjoint"],
+                        help="Polyvore split (disjoint = items don't overlap between train/test)")
+    parser.add_argument("--num_samples", type=int, default=10000, help="Number of FITB questions to eval")
     args = parser.parse_args()
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -38,8 +42,12 @@ def main():
         print(f"✅ Found pre-computed embeddings at {emb_path}! Loading for instant evaluation...")
         embeddings_dict = torch.load(emb_path, map_location="cpu", weights_only=True)
     
-    nd_def = load_dataset("owj0421/polyvore-outfits", "nondisjoint_default")
-    
+    default_config = f"{args.split}_default"
+    fitb_config = f"{args.split}_fill_in_the_blank"
+    print(f"Evaluating on split: {args.split}")
+
+    nd_def = load_dataset("owj0421/polyvore-outfits", default_config)
+
     set_to_item = {}
     for split in ['train', 'validation', 'test']:
         for row in nd_def[split]:
@@ -47,10 +55,9 @@ def main():
             for it in row['items']:
                 key = f"{set_id}_{it['index']}"
                 set_to_item[key] = it['item_id']
-                
-    fitb_test = load_dataset("owj0421/polyvore-outfits", "nondisjoint_fill_in_the_blank", split="test")
-    # We will test on 500 randomized hold-out samples for a fast but robust demonstration (full 10,000 takes ~25 mins)
-    fitb_test = fitb_test.select(range(10000))
+
+    fitb_test = load_dataset("owj0421/polyvore-outfits", fitb_config, split="test")
+    fitb_test = fitb_test.select(range(min(args.num_samples, len(fitb_test))))
     
     correct_count = 0
     total_count = 0

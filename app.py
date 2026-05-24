@@ -14,7 +14,7 @@ from model import OutfitTransformer
 # Page config & global styling
 # ──────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="ATELIER — AI Stylist",
+    page_title="Fashion Recommender",
     page_icon="◈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -22,8 +22,8 @@ st.set_page_config(
 
 st.markdown(
     """
-    <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;500;600;700;800&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
     <style>
+      @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;500;600;700;800&family=Inter:wght@300;400;500;600&display=swap');
       /* ── Light theme override ── */
       .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"],
       [data-testid="stSidebar"] > div, [data-testid="stSidebarContent"] {
@@ -157,10 +157,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.markdown('<h1 class="brand">Atelier</h1>', unsafe_allow_html=True)
+st.markdown('<h1 class="brand">Fashion Recommender</h1>', unsafe_allow_html=True)
 st.markdown('<div class="brand-rule"></div>', unsafe_allow_html=True)
 st.markdown(
-    '<p class="tagline">An AI atelier — composed outfits, retrieved from a curated archive.</p>',
+    '<p class="tagline">Pick a seed garment — the model retrieves complementary items to complete the outfit.</p>',
     unsafe_allow_html=True,
 )
 
@@ -168,7 +168,7 @@ st.markdown(
 # Config
 # ──────────────────────────────────────────────────────────────────────────────
 EMBED_PATH = "polyvore_embeddings.pt"
-DB_SIZE = 5000
+DB_SIZE = 50000  # 10x more diversity than the old 5k cap; 251k full DB OOMs on 16GB Macs
 DEFAULT_BLUEPRINT = ["tops", "bottoms", "shoes", "bags"]
 DRESS_BLUEPRINT = ["outerwear", "shoes", "bags", "jewelry"]
 AVAILABLE_CATEGORIES = ["tops", "bottoms", "dresses", "outerwear", "shoes", "bags", "accessories", "jewelry", "hats"]
@@ -221,10 +221,11 @@ def load_assets():
     model.eval()
 
     embeddings_dict = torch.load(EMBED_PATH, map_location="cpu", weights_only=False)
-    all_item_ids = list(embeddings_dict.keys())[:DB_SIZE]
+    cap = DB_SIZE if DB_SIZE is not None else len(embeddings_dict)
+    all_item_ids = list(embeddings_dict.keys())[:cap]
 
     polyvore_items = load_dataset("owj0421/polyvore", split="data")
-    db_items = polyvore_items.select(range(DB_SIZE))
+    db_items = polyvore_items.select(range(min(cap, len(polyvore_items))))
     id_to_idx = {item["item_id"]: i for i, item in enumerate(db_items)}
 
     db_features, db_categories, db_images, db_ids = [], [], [], []
@@ -508,7 +509,7 @@ st.divider()
 # Output — Alternatives (from top pick)
 # ──────────────────────────────────────────────────────────────────────────────
 st.markdown(
-    '<h2 class="section">The Atelier&#39;s Notes <span class="muted">alternates per slot</span></h2>',
+    '<h2 class="section">Per-Slot Alternatives <span class="muted">top pick&#39;s candidate pool</span></h2>',
     unsafe_allow_html=True,
 )
 
