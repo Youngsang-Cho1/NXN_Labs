@@ -50,7 +50,7 @@ def main():
                 
     fitb_test = load_dataset("owj0421/polyvore-outfits", "nondisjoint_fill_in_the_blank", split="test")
     # We will test on 500 randomized hold-out samples for a fast but robust demonstration (full 10,000 takes ~25 mins)
-    fitb_test = fitb_test.select(range(500))
+    fitb_test = fitb_test.select(range(10000))
     
     correct_count = 0
     total_count = 0

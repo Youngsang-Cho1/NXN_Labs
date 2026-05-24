@@ -23,20 +23,9 @@ class OutfitTransformer(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # 2b. Cross-attention decoder: target query attends to context.
-        # Splitting query from context (vs concatenating) gives the query a
-        # dedicated path to ask "what do I need given this outfit?" instead of
-        # being one undifferentiated token among many.
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=self.embed_dim,
-            nhead=8,
-            dim_feedforward=2048,
-            activation="gelu",
-            batch_first=True,
-        )
-        self.cross_attn = nn.TransformerDecoder(decoder_layer, num_layers=2)
-
         # Fuse per-item image + text emb into a single context token.
+        # This is the meaningful change over baseline: each context item now
+        # carries its description, not just its visual features.
         self.context_fuse = nn.Sequential(
             nn.Linear(self.embed_dim * 2, self.embed_dim),
             nn.GELU(),
@@ -92,18 +81,16 @@ class OutfitTransformer(nn.Module):
             fused = context_img_features
         context_tokens = fused + self.image_type_emb  # [B, Seq, D]
 
-        # ---- Self-attention: context items reason about each other ----
-        context_encoded = self.transformer(context_tokens, src_key_padding_mask=context_mask)
+        # ---- Concat query at position 0, then self-attention over full sequence ----
+        # Putting query in the sequence (vs separate cross-attn tgt) prevents
+        # the collapse where a mostly-constant mask_token query gets routed
+        # straight to the output regardless of context.
+        full_seq = torch.cat([query, context_tokens], dim=1)  # [B, 1+Seq, D]
+        query_pad = torch.zeros(B, 1, dtype=torch.bool, device=context_mask.device)
+        full_mask = torch.cat([query_pad, context_mask], dim=1)
 
-        # ---- Cross-attention: query asks the context what it needs ----
-        # tgt = query [B, 1, D], memory = context_encoded [B, Seq, D]
-        decoded = self.cross_attn(
-            tgt=query,
-            memory=context_encoded,
-            memory_key_padding_mask=context_mask,
-        )  # [B, 1, D]
-
-        target_embedding_pred = self.projection_head(decoded.squeeze(1))
+        encoded = self.transformer(full_seq, src_key_padding_mask=full_mask)
+        target_embedding_pred = self.projection_head(encoded[:, 0, :])
         return torch.nn.functional.normalize(target_embedding_pred, p=2, dim=-1)
 
     def forward(self, context_images, context_mask, target_text_tokens=None):

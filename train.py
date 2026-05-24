@@ -101,7 +101,6 @@ def main():
     
     trainable_params = (
         list(model.transformer.parameters()) +
-        list(model.cross_attn.parameters()) +
         list(model.context_fuse.parameters()) +
         list(model.projection_head.parameters()) +
         [model.logit_scale, model.text_type_emb, model.image_type_emb, model.mask_token]
