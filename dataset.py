@@ -72,11 +72,13 @@ class OutfitRetrievalDataset(Dataset):
         context_item_ids = [outfit_items[i] for i in range(len(outfit_items)) if i != target_idx]
         
         target_image, target_text = self._get_item_data(target_item_id)
-        
+
         context_images = []
+        context_texts = []
         for i_id in context_item_ids[:self.max_outfit_size]:
-            img, _ = self._get_item_data(i_id)
+            img, txt = self._get_item_data(i_id)
             context_images.append(img)
+            context_texts.append(txt)
             
         # Negatives (Hard + Easy Strategy)
         negative_images = []
@@ -90,23 +92,27 @@ class OutfitRetrievalDataset(Dataset):
         hard_candidates = self.category_to_item_ids.get(t_cat, [])
         valid_candidates = [c for c in hard_candidates if c not in outfit_items]
         
-        # If we have precomputed embeddings, do Visual Hard Negative Mining
+        # If we have precomputed embeddings, do Mid-Similarity Hard Negative Mining.
+        # Picking the top-K MOST similar items as negatives is harmful: when a same-
+        # category item looks nearly identical to the target, it's often equally
+        # compatible with the outfit -> false negative -> conflicting gradients.
+        # Instead, pick items in the 60-90th percentile of similarity: same category,
+        # visually plausible distractors, but unlikely to be true positives.
         if self.embeddings_dict is not None and target_item_id in self.embeddings_dict and len(valid_candidates) >= self.num_negatives:
-            # Sample a pool to keep matrix multiplication very fast
             pool_size = min(100, len(valid_candidates))
             pool_ids = random.sample(valid_candidates, pool_size)
-            
-            # Fetch embeddings
+
             target_emb = self.embeddings_dict[target_item_id]["image"]
             candidate_embs = torch.stack([self.embeddings_dict[c_id]["image"] for c_id in pool_ids])
-            
-            # Compute Cosine Similarity (vectors are already L2 normalized)
             sims = torch.matmul(candidate_embs, target_emb)
-            
-            # Pick top-K most visually similar items as the hard negatives!
-            top_k_indices = torch.topk(sims, k=self.num_negatives).indices
-            hard_negative_ids = [pool_ids[i] for i in top_k_indices]
-            
+
+            sorted_idx = torch.argsort(sims, descending=True)
+            lo = int(0.10 * len(sorted_idx))
+            hi = int(0.40 * len(sorted_idx))
+            band = sorted_idx[lo:hi] if hi - lo >= self.num_negatives else sorted_idx[:self.num_negatives]
+            chosen = band[torch.randperm(len(band))[:self.num_negatives]]
+            hard_negative_ids = [pool_ids[i] for i in chosen.tolist()]
+
             for neg_id in hard_negative_ids:
                 img, _ = self._get_item_data(neg_id)
                 negative_images.append(img)
@@ -130,6 +136,7 @@ class OutfitRetrievalDataset(Dataset):
                 
         return {
             "context_images": context_images,
+            "context_texts": context_texts,
             "target_image": target_image,
             "target_text": target_text,
             "negative_images": negative_images
@@ -157,23 +164,36 @@ def outfit_collate_fn(batch, max_outfit_size=8):
             sample_ctx = item["context_images"][0]
             break
             
+    # Detect if context texts are tensors (precomputed) -> pad them too
+    has_text_tensors = (
+        sample_ctx is not None
+        and len(batch[0].get("context_texts", [])) > 0
+        and isinstance(batch[0]["context_texts"][0], torch.Tensor)
+    )
+
     if sample_ctx is not None:
         shape = sample_ctx.shape
         padded_context = torch.zeros((batch_size, max_outfit_size, *shape))
         context_pad_mask = torch.ones((batch_size, max_outfit_size), dtype=torch.bool)
-        
+        padded_context_text = (
+            torch.zeros((batch_size, max_outfit_size, *shape)) if has_text_tensors else None
+        )
+
         for b_idx, item in enumerate(batch):
             seq_len = len(item["context_images"])
             if seq_len > 0:
                 padded_context[b_idx, :seq_len] = torch.stack(item["context_images"])
                 context_pad_mask[b_idx, :seq_len] = False
+                if has_text_tensors:
+                    padded_context_text[b_idx, :seq_len] = torch.stack(item["context_texts"])
     else:
-        # Fallback if no context items across entire batch (rare edge case)
         padded_context = torch.zeros((batch_size, max_outfit_size, 1))
         context_pad_mask = torch.ones((batch_size, max_outfit_size), dtype=torch.bool)
+        padded_context_text = None
 
     return {
         "context_images": padded_context,
+        "context_texts": padded_context_text,
         "context_mask": context_pad_mask,
         "target_image": target_images,
         "target_texts": target_texts,

@@ -266,12 +266,14 @@ if not queries:
 # ──────────────────────────────────────────────────────────────────────────────
 with st.spinner("Composing outfit…"):
     context_embeddings = [embeddings[seed_item_id]["image"].unsqueeze(0)]
+    context_text_embs = [embeddings[seed_item_id]["text"].unsqueeze(0)]
     context_images = [seed_img]
     used_ids = {seed_item_id}
     history = []
 
     for query in queries:
         context_feats = torch.cat(context_embeddings, dim=0).unsqueeze(0).to(device)
+        context_txts = torch.cat(context_text_embs, dim=0).unsqueeze(0).to(device)
         context_mask = torch.zeros((1, context_feats.shape[1]), dtype=torch.bool, device=device)
 
         text_features = None
@@ -281,7 +283,10 @@ with st.spinner("Composing outfit…"):
                 text_features = model.siglip.encode_text(target_token, normalize=True)
 
         with torch.no_grad():
-            ideal_emb = model.encode_features(context_feats, context_mask, text_features)
+            ideal_emb = model.encode_features(
+                context_feats, context_mask, text_features,
+                context_text_features=context_txts,
+            )
 
         results = search_top_k(
             ideal_emb, db_features, db_categories, db_images, db_ids,
@@ -292,6 +297,7 @@ with st.spinner("Composing outfit…"):
         used_ids.add(best_id)
         context_images.append(best_img)
         context_embeddings.append(embeddings[best_id]["image"].unsqueeze(0))
+        context_text_embs.append(embeddings[best_id]["text"].unsqueeze(0))
         history.append({"query": query, "results": results})
 
 # ──────────────────────────────────────────────────────────────────────────────

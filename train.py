@@ -44,9 +44,11 @@ def main():
     parser = argparse.ArgumentParser(description="Train OutfitTransformer")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--epochs", type=int, default=3, help="Number of epochs")
-    parser.add_argument("--text_dropout", type=float, default=0.2, help="Text dropout probability")
+    parser.add_argument("--text_dropout", type=float, default=0.3, help="Text dropout probability (per-sample)")
     parser.add_argument("--num_layers", type=int, default=4, help="Transformer encoder layers")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
+    parser.add_argument("--resume_from", type=str, default=None, help="Optional checkpoint to warm-start from")
+    parser.add_argument("--save_prefix", type=str, default="outfit_transformer", help="Filename prefix for saved checkpoints")
     args = parser.parse_args()
     print(f"\n🔧 Hyperparameters: lr={args.lr}, epochs={args.epochs}, text_dropout={args.text_dropout}, num_layers={args.num_layers}")
     if torch.backends.mps.is_available():
@@ -59,6 +61,9 @@ def main():
     print(f" Using Device: {device}")
     
     model = OutfitTransformer(num_layers=args.num_layers).to(device)
+    if args.resume_from and os.path.exists(args.resume_from):
+        print(f"📥 Warm-starting from {args.resume_from}")
+        model.load_state_dict(torch.load(args.resume_from, map_location=device, weights_only=True), strict=False)
     model.train()
     
     print("Loading Polyvore Datasets...")
@@ -94,13 +99,15 @@ def main():
         collate_fn=outfit_collate_fn
     )
     
-    # ✅ FIX: Include ALL new trainable components in optimizer
     trainable_params = (
         list(model.transformer.parameters()) +
+        list(model.cross_attn.parameters()) +
+        list(model.context_fuse.parameters()) +
         list(model.projection_head.parameters()) +
         [model.logit_scale, model.text_type_emb, model.image_type_emb, model.mask_token]
     )
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     print(f"🧠 Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
     
     for epoch in range(args.epochs):
@@ -112,10 +119,10 @@ def main():
             
             if embeddings_dict:
                 # FAST VECTOR ROUTE
-                context_img_features = batch["context_images"].to(device)
+                context_img_features = batch["context_images"].to(device).clone()
                 context_mask = batch["context_mask"].to(device)
-                
-                # [Strategy 4] Context Shuffle Augmentation
+
+                # [Strategy 4] Context Shuffle Augmentation (out-of-place on clone above)
                 B_size = context_mask.shape[0]
                 for b_idx in range(B_size):
                     valid_idx = (~context_mask[b_idx]).nonzero(as_tuple=True)[0]
@@ -126,13 +133,21 @@ def main():
                 target_img_features = batch["target_image"].to(device)
                 negative_img_features = batch["negative_images"].to(device)
                 target_text_features = batch["target_texts"].to(device)
-                
-                # [Strategy 3] Modality/Text Dropout (20% chance to drop text hints)
-                if torch.rand(1).item() < args.text_dropout:
-                    target_text_features = None
-                
-                # Forward Pass strictly through Transformer (SigLIP is skipped)
-                pred_target_emb = model.encode_features(context_img_features, context_mask, target_text_features)
+                context_text_features = (
+                    batch["context_texts"].to(device) if batch.get("context_texts") is not None else None
+                )
+
+                # [Strategy 3] Sample-wise text dropout: each sample independently drops
+                # text with prob=text_dropout. Critical because FITB eval is text-free,
+                # so mask_token needs many more training samples than batch-level dropout
+                # (1 coin flip per batch) ever delivered.
+                text_drop_mask = torch.rand(B_size, device=device) < args.text_dropout
+
+                pred_target_emb = model.encode_features(
+                    context_img_features, context_mask,
+                    target_text_features, text_drop_mask=text_drop_mask,
+                    context_text_features=context_text_features,
+                )
                 
                 # [Strategy 1] Calculate Loss with Learnable Temperature
                 # Explicitly L2 normalize to guarantee cosine similarity
@@ -183,8 +198,9 @@ def main():
             # Update tqdm progress bar
             progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
             
-        print(f"\n Epoch {epoch+1} completed! Saving model weights...")
-        torch.save(model.state_dict(), f"outfit_transformer_epoch_{epoch+1}.pt")
+        scheduler.step()
+        print(f"\n Epoch {epoch+1} completed! LR now {optimizer.param_groups[0]['lr']:.2e}. Saving weights...")
+        torch.save(model.state_dict(), f"{args.save_prefix}_epoch_{epoch+1}.pt")
 
 if __name__ == "__main__":
     main()

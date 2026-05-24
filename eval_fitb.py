@@ -70,30 +70,37 @@ def main():
         candidate_keys = row['candidates'] # List of exactly 4 multiple choices
         true_label = row['label'] # The correct answer index (0, 1, 2, or 3)
         
-        # Build Context Images representing the partial outfit
-        context_tensors = []
+        # Build context image AND text tensors representing the partial outfit
+        context_img_tensors = []
+        context_txt_tensors = []
         for ck in context_keys:
             data = get_data(ck)
             if not data: continue
-            
+
             if embeddings_dict and data['item_id'] in embeddings_dict:
-                c_tensor = embeddings_dict[data['item_id']]["image"].unsqueeze(0)
+                emb = embeddings_dict[data['item_id']]
+                context_img_tensors.append(emb["image"].unsqueeze(0))
+                context_txt_tensors.append(emb["text"].unsqueeze(0))
             else:
                 img = data["image"]
                 if getattr(img, "mode", "RGB") != "RGB": img = img.convert("RGB")
-                c_tensor = model.preprocess_train(img).unsqueeze(0)
-            context_tensors.append(c_tensor)
-            
-        if not context_tensors: continue
-        
-        # [1, Seq, C, H, W]
-        context_images_tensor = torch.stack(context_tensors, dim=1).to(device)
-        context_mask = torch.zeros((1, len(context_tensors)), dtype=torch.bool).to(device)
-        
-        # 1. Pure Visual FITB: Generate the ideal completion WITHOUT text hints.
-        # This properly tests the model's visual reasoning capabilities.
+                context_img_tensors.append(model.preprocess_train(img).unsqueeze(0))
+
+        if not context_img_tensors: continue
+
+        context_images_tensor = torch.stack(context_img_tensors, dim=1).to(device)
+        context_mask = torch.zeros((1, len(context_img_tensors)), dtype=torch.bool).to(device)
+        context_texts_tensor = (
+            torch.stack(context_txt_tensors, dim=1).to(device) if context_txt_tensors else None
+        )
+
+        # Pure-visual FITB: no target text hint, but context text is available.
         with torch.no_grad():
-            ideal_emb = model.encode_features(context_images_tensor, context_mask, target_text_features=None)
+            ideal_emb = model.encode_features(
+                context_images_tensor, context_mask,
+                target_text_features=None,
+                context_text_features=context_texts_tensor,
+            )
             
         candidate_distances = []
         

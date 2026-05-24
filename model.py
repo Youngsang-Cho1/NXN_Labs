@@ -13,24 +13,45 @@ class OutfitTransformer(nn.Module):
         # Determine embedding dimension from the base model
         self.embed_dim = self.siglip.text_projection.shape[1] if hasattr(self.siglip, "text_projection") else 768
         
-        # 2. Transformer Encoder Layer
-        # Takes [Sequence of Outfits] and models interactions (Self-Attention)
+        # 2. Self-attention encoder: lets context items reason about each other.
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.embed_dim, 
-            nhead=8, 
-            dim_feedforward=2048, 
-            activation="gelu", 
-            batch_first=True
+            d_model=self.embed_dim,
+            nhead=8,
+            dim_feedforward=2048,
+            activation="gelu",
+            batch_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # 2b. Cross-attention decoder: target query attends to context.
+        # Splitting query from context (vs concatenating) gives the query a
+        # dedicated path to ask "what do I need given this outfit?" instead of
+        # being one undifferentiated token among many.
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=self.embed_dim,
+            nhead=8,
+            dim_feedforward=2048,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.cross_attn = nn.TransformerDecoder(decoder_layer, num_layers=2)
+
+        # Fuse per-item image + text emb into a single context token.
+        self.context_fuse = nn.Sequential(
+            nn.Linear(self.embed_dim * 2, self.embed_dim),
+            nn.GELU(),
+            nn.Linear(self.embed_dim, self.embed_dim),
+        )
         
         # [Strategy 1] Learnable Temperature for InfoNCE Loss
         self.logit_scale = nn.Parameter(torch.tensor(math.log(1 / 0.07)))
         
         # [Strategy 3] Modality Embeddings and Mask Token
-        self.text_type_emb = nn.Parameter(torch.randn(1, 1, self.embed_dim) * 0.02)
-        self.image_type_emb = nn.Parameter(torch.randn(1, 1, self.embed_dim) * 0.02)
-        self.mask_token = nn.Parameter(torch.randn(1, 1, self.embed_dim) * 0.02)
+        # Scale 0.1 (not 0.02): SigLIP features are L2-normalized (~1.0); too-small
+        # modality emb becomes pure noise and gets ignored during attention.
+        self.text_type_emb = nn.Parameter(torch.randn(1, 1, self.embed_dim) * 0.1)
+        self.image_type_emb = nn.Parameter(torch.randn(1, 1, self.embed_dim) * 0.1)
+        self.mask_token = nn.Parameter(torch.randn(1, 1, self.embed_dim) * 0.1)
         
         # [Strategy 2] MLP Projection Head
         # Projects the reasoning outcome into the final visual compatibility space
@@ -40,44 +61,50 @@ class OutfitTransformer(nn.Module):
             nn.Linear(self.embed_dim, self.embed_dim)
         )
 
-    def encode_features(self, context_img_features, context_mask, target_text_features=None):
+    def encode_features(self, context_img_features, context_mask,
+                        target_text_features=None, text_drop_mask=None,
+                        context_text_features=None):
         """
-        Directly process pre-computed embeddings for massive speedup.
-        context_img_features: [Batch, Max_Seq, Embed_Dim]
-        context_mask: [Batch, Max_Seq] (True means ignore/pad)
-        target_text_features: [Batch, Embed_Dim] or None for Text Dropout
+        context_img_features:   [B, Seq, D]
+        context_text_features:  [B, Seq, D] or None (when None, fall back to image-only context)
+        context_mask:           [B, Seq] (True = pad)
+        target_text_features:   [B, D] or None
+        text_drop_mask:         [B] bool, True = drop target text (use mask_token)
         """
-        B, seq_len, embed_dim = context_img_features.shape
-        
-        # Apply Modality/Text Dropout logic
+        B, seq_len, D = context_img_features.shape
+
+        # ---- Build target query token ----
         if target_text_features is not None:
-            text_features = target_text_features.unsqueeze(1) + self.text_type_emb
+            query = target_text_features.unsqueeze(1) + self.text_type_emb  # [B, 1, D]
+            if text_drop_mask is not None:
+                mask_tok = self.mask_token.expand(B, 1, -1)
+                drop = text_drop_mask.view(B, 1, 1).to(query.dtype)
+                query = drop * mask_tok + (1 - drop) * query
         else:
-            text_features = self.mask_token.expand(B, 1, -1)
-            
-        # Apply Image Modality Embedding
-        context_img_features = context_img_features + self.image_type_emb
-        
-        # The sequence is: [TARGET_ITEM_TOKEN, CONTEXT_ITEM_1, CONTEXT_ITEM_2, ...]
-        transformer_input = torch.cat([text_features, context_img_features], dim=1) # [B, 1 + Seq, Embed]
-        
-        # The Target Token is at index 0 and shouldn't be masked out
-        target_mask = torch.zeros((B, 1), dtype=torch.bool, device=context_mask.device)
-        full_mask = torch.cat([target_mask, context_mask], dim=1)
-        
-        # Pass through Self-Attention block
-        encoded_sequence = self.transformer(transformer_input, src_key_padding_mask=full_mask)
-        
-        # Extract the target item prediction embedding at index 0
-        target_embedding_pred = encoded_sequence[:, 0, :]
-        
-        # Apply projection head
-        target_embedding_pred = self.projection_head(target_embedding_pred)
-        
-        # L2 Normalize
-        target_embedding_pred = torch.nn.functional.normalize(target_embedding_pred, p=2, dim=-1)
-        
-        return target_embedding_pred
+            query = self.mask_token.expand(B, 1, -1)
+
+        # ---- Fuse per-item image + text into context tokens ----
+        if context_text_features is not None:
+            fused = self.context_fuse(
+                torch.cat([context_img_features, context_text_features], dim=-1)
+            )
+        else:
+            fused = context_img_features
+        context_tokens = fused + self.image_type_emb  # [B, Seq, D]
+
+        # ---- Self-attention: context items reason about each other ----
+        context_encoded = self.transformer(context_tokens, src_key_padding_mask=context_mask)
+
+        # ---- Cross-attention: query asks the context what it needs ----
+        # tgt = query [B, 1, D], memory = context_encoded [B, Seq, D]
+        decoded = self.cross_attn(
+            tgt=query,
+            memory=context_encoded,
+            memory_key_padding_mask=context_mask,
+        )  # [B, 1, D]
+
+        target_embedding_pred = self.projection_head(decoded.squeeze(1))
+        return torch.nn.functional.normalize(target_embedding_pred, p=2, dim=-1)
 
     def forward(self, context_images, context_mask, target_text_tokens=None):
         """
