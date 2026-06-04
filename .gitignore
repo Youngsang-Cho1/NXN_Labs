@@ -3,3 +3,10 @@
 __pycache__/
 .DS_Store
 *.pyc
+.env
+.env.local
+vlm_results*.csv
+outfit_grids/
+*.log
+qdrant_data/
+qdrant_db/

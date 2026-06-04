@@ -1,0 +1,5 @@
+ablation,fitb_accuracy
+baseline_full,63.78
+no_context_text,26.25
+topk_neg,62.02
+no_text_dropout,30.33

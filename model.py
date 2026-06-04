@@ -110,21 +110,3 @@ class OutfitTransformer(nn.Module):
             
         img_features = img_features.view(B, seq_len, self.embed_dim)
         return self.encode_features(img_features, context_mask, text_features)
-        
-    def unfreeze_siglip(self, unfreeze_vision_blocks=1):
-        """
-        Unfreezes the last N blocks of the SigLIP vision encoder for Phase 2 fine-tuning.
-        """
-        self.siglip.train()
-        for param in self.siglip.parameters():
-            param.requires_grad = False
-            
-        # Unfreeze specific visual transformer blocks
-        # (Marqo SigLIP uses a ViT backbone under OpenCLIP's standard module names)
-        if hasattr(self.siglip, "visual") and hasattr(self.siglip.visual, "trunk") and hasattr(self.siglip.visual.trunk, "blocks"):
-            blocks = self.siglip.visual.trunk.blocks
-            for block in list(blocks)[-unfreeze_vision_blocks:]:
-                for param in block.parameters():
-                    param.requires_grad = True
-                    
-        print(f"SigLIP partially unfrozen: last {unfreeze_vision_blocks} vision blocks enabled for fine-tuning.")

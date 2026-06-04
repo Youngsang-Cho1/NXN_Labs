@@ -49,6 +49,13 @@ def main():
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
     parser.add_argument("--resume_from", type=str, default=None, help="Optional checkpoint to warm-start from")
     parser.add_argument("--save_prefix", type=str, default="outfit_transformer", help="Filename prefix for saved checkpoints")
+    parser.add_argument("--split", type=str, default="nondisjoint",
+                        choices=["nondisjoint", "disjoint"],
+                        help="Polyvore split to train on. Must match the FITB split used for eval to avoid item-id leak.")
+    parser.add_argument("--no_context_text", action="store_true",
+                        help="Ablation: disable per-item text fusion in context (image only)")
+    parser.add_argument("--neg_strategy", type=str, default="midsim", choices=["midsim", "topk"],
+                        help="Hard negative mining strategy. 'topk' ablation tests whether mid-sim is better than naive top-K.")
     args = parser.parse_args()
     print(f"\n🔧 Hyperparameters: lr={args.lr}, epochs={args.epochs}, text_dropout={args.text_dropout}, num_layers={args.num_layers}")
     if torch.backends.mps.is_available():
@@ -68,7 +75,8 @@ def main():
     
     print("Loading Polyvore Datasets...")
     polyvore_items = load_dataset("owj0421/polyvore", split="data")
-    polyvore_outfits = load_dataset("owj0421/polyvore-outfits", "nondisjoint_default", split="train")
+    polyvore_outfits = load_dataset("owj0421/polyvore-outfits", f"{args.split}_default", split="train")
+    print(f"📂 Training split: {args.split}_default ({len(polyvore_outfits)} outfits)")
     
     embeddings_dict = None
     emb_path = "polyvore_embeddings.pt"
@@ -82,11 +90,12 @@ def main():
     print("Preparing full dataset training. (This will parse all 53,000 outfits!)")
     
     train_dataset = OutfitRetrievalDataset(
-        polyvore_outfits, 
-        polyvore_items, 
+        polyvore_outfits,
+        polyvore_items,
         transform=model.preprocess_train if not embeddings_dict else None,
         embeddings_dict=embeddings_dict,
-        num_negatives=2
+        num_negatives=2,
+        neg_strategy=args.neg_strategy,
     )
     
     train_loader = DataLoader(
@@ -132,9 +141,12 @@ def main():
                 target_img_features = batch["target_image"].to(device)
                 negative_img_features = batch["negative_images"].to(device)
                 target_text_features = batch["target_texts"].to(device)
-                context_text_features = (
-                    batch["context_texts"].to(device) if batch.get("context_texts") is not None else None
-                )
+                if args.no_context_text:
+                    context_text_features = None
+                else:
+                    context_text_features = (
+                        batch["context_texts"].to(device) if batch.get("context_texts") is not None else None
+                    )
 
                 # [Strategy 3] Sample-wise text dropout: each sample independently drops
                 # text with prob=text_dropout. Critical because FITB eval is text-free,
@@ -183,6 +195,7 @@ def main():
                 # 2. Extract Reality
                 with torch.no_grad():
                     pos_features = model.siglip.encode_image(target_image, normalize=True)
+                    B, num_neg, C, H, W = negative_images.shape
                     neg_flat = negative_images.view(-1, C, H, W)
                     neg_features = model.siglip.encode_image(neg_flat, normalize=True)
                     negative_img_features = neg_features.view(B, num_neg, model.embed_dim)
@@ -199,7 +212,19 @@ def main():
             
         scheduler.step()
         print(f"\n Epoch {epoch+1} completed! LR now {optimizer.param_groups[0]['lr']:.2e}. Saving weights...")
-        torch.save(model.state_dict(), f"{args.save_prefix}_epoch_{epoch+1}.pt")
+        torch.save({
+            "state_dict": model.state_dict(),
+            "hparams": {
+                "num_layers": args.num_layers,
+                "text_dropout": args.text_dropout,
+                "lr": args.lr,
+                "batch_size": args.batch_size,
+                "epoch": epoch + 1,
+                "split": args.split,
+                "no_context_text": args.no_context_text,
+                "neg_strategy": args.neg_strategy,
+            },
+        }, f"{args.save_prefix}_epoch_{epoch+1}.pt")
 
 if __name__ == "__main__":
     main()

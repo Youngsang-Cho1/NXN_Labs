@@ -7,8 +7,14 @@ import random
 import streamlit as st
 import torch
 from datasets import load_dataset
+from qdrant_client import QdrantClient
+from qdrant_client.models import Filter, FieldCondition, MatchValue
 
 from model import OutfitTransformer
+
+QDRANT_HOST = "localhost"
+QDRANT_PORT = 6333
+QDRANT_COLLECTION = "polyvore_items"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Page config & global styling
@@ -168,21 +174,24 @@ st.markdown(
 # Config
 # ──────────────────────────────────────────────────────────────────────────────
 EMBED_PATH = "polyvore_embeddings.pt"
-DB_SIZE = 50000  # 10x more diversity than the old 5k cap; 251k full DB OOMs on 16GB Macs
+# Slots are now assigned by SigLIP zero-shot at index time, see build_qdrant.py.
+# These must match SLOT_PROMPTS in build_qdrant.py.
 DEFAULT_BLUEPRINT = ["tops", "bottoms", "shoes", "bags"]
 DRESS_BLUEPRINT = ["outerwear", "shoes", "bags", "jewelry"]
-AVAILABLE_CATEGORIES = ["tops", "bottoms", "dresses", "outerwear", "shoes", "bags", "accessories", "jewelry", "hats"]
+AVAILABLE_SLOTS = ["tops", "bottoms", "dresses", "one-piece",
+                   "outerwear", "shoes", "bags", "accessories", "jewelry", "hats"]
 
-# Slots that don't make sense to layer onto certain seeds.
-# Dresses already cover top+bottom; suggesting tops/bottoms produces clashing outfits.
+# One-piece garments (dresses, jumpsuits, rompers) already cover top+bottom.
+# Layering tops/bottoms onto them produces clashing outfits.
 INCOMPATIBLE_SLOTS = {
-    "dresses": {"tops", "bottoms", "dresses"},
-    "tops":    {"tops", "dresses"},
-    "bottoms": {"bottoms", "dresses"},
-    "shoes":   {"shoes"},
-    "bags":    {"bags"},
+    "dresses":   {"tops", "bottoms", "dresses", "one-piece"},
+    "one-piece": {"tops", "bottoms", "dresses", "one-piece"},
+    "tops":      {"tops", "dresses", "one-piece"},
+    "bottoms":   {"bottoms", "dresses", "one-piece"},
+    "shoes":     {"shoes"},
+    "bags":      {"bags"},
     "outerwear": {"outerwear"},
-    "hats":    {"hats"},
+    "hats":      {"hats"},
 }
 
 
@@ -207,97 +216,119 @@ def best_checkpoint() -> str | None:
 # ──────────────────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def load_assets():
+    """Model + Qdrant client. No giant in-memory tensor, no full HF dataset dict."""
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
-    model = OutfitTransformer(num_layers=4).to(device)
     ckpt = best_checkpoint()
     ckpt_label = "random init"
+    num_layers = 4
+    state_dict = None
     if ckpt:
-        model.load_state_dict(
-            torch.load(ckpt, map_location=device, weights_only=True),
-            strict=False,
-        )
+        blob = torch.load(ckpt, map_location=device, weights_only=True)
+        if isinstance(blob, dict) and "state_dict" in blob:
+            state_dict = blob["state_dict"]
+            num_layers = blob.get("hparams", {}).get("num_layers", 4)
+        else:
+            state_dict = blob
         ckpt_label = ckpt
+
+    model = OutfitTransformer(num_layers=num_layers).to(device)
+    if state_dict is not None:
+        model.load_state_dict(state_dict, strict=False)
     model.eval()
 
+    qclient = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=60)
+    db_count = qclient.get_collection(QDRANT_COLLECTION).points_count
+
     embeddings_dict = torch.load(EMBED_PATH, map_location="cpu", weights_only=False)
-    cap = DB_SIZE if DB_SIZE is not None else len(embeddings_dict)
-    all_item_ids = list(embeddings_dict.keys())[:cap]
 
+    # Materializing polyvore_items["item_id"] is a full 251k column scan (~3-5 min).
+    # Cache the id→row dict on disk so only the first launch pays for it.
     polyvore_items = load_dataset("owj0421/polyvore", split="data")
-    db_items = polyvore_items.select(range(min(cap, len(polyvore_items))))
-    id_to_idx = {item["item_id"]: i for i, item in enumerate(db_items)}
+    id_map_cache = "id_to_row.pt"
+    if os.path.exists(id_map_cache):
+        id_to_row = torch.load(id_map_cache, weights_only=False)
+    else:
+        id_to_row = {it_id: i for i, it_id in enumerate(polyvore_items["item_id"])}
+        torch.save(id_to_row, id_map_cache)
 
-    db_features, db_categories, db_images, db_ids = [], [], [], []
-    for item_id in all_item_ids:
-        if item_id not in id_to_idx:
-            continue
-        item = db_items[id_to_idx[item_id]]
-        img = item["image"]
-        if getattr(img, "mode", "RGB") != "RGB":
-            img = img.convert("RGB")
-        cat = str(item.get("category") or item.get("title") or item.get("description") or "").lower()
-
-        db_features.append(embeddings_dict[item_id]["image"])
-        db_categories.append(cat)
-        db_images.append(img)
-        db_ids.append(item_id)
-
-    db_features_tensor = torch.stack(db_features).to(device)
     return {
         "model": model,
         "embeddings": embeddings_dict,
-        "db_features": db_features_tensor,
-        "db_categories": db_categories,
-        "db_images": db_images,
-        "db_ids": db_ids,
+        "qclient": qclient,
+        "polyvore_items": polyvore_items,
+        "id_to_row": id_to_row,
+        "db_count": db_count,
         "device": device,
         "ckpt": ckpt_label,
     }
 
 
+@st.cache_data(show_spinner=False, max_entries=2048)
+def get_item_image(item_id: str):
+    """Lazy image loader, cached per item_id (Streamlit reruns are free after first)."""
+    row_idx = A["id_to_row"].get(item_id)
+    if row_idx is None:
+        return None
+    item = A["polyvore_items"][row_idx]
+    img = item["image"]
+    if getattr(img, "mode", "RGB") != "RGB":
+        img = img.convert("RGB")
+    return img
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Retrieval
 # ──────────────────────────────────────────────────────────────────────────────
-def search_top_k(target_emb, db_features, db_categories, db_images, db_ids,
-                 require_keyword: str | None = None, k: int = 3, exclude_ids: set | None = None):
-    """Cosine similarity (vectors are L2-normalized)."""
-    sims = (db_features @ target_emb.squeeze(0)).squeeze(-1)
-    order = torch.argsort(sims, descending=True)
+def qdrant_search(qclient, target_emb, slot: str | None = None,
+                  k: int = 3, exclude_ids: set | None = None):
+    """Cosine ANN search with native Qdrant slot filtering.
+
+    Slots are SigLIP-classified at index time (see build_qdrant.py), so the
+    filter is exact (not substring) and runs server-side.
+    """
     exclude_ids = exclude_ids or set()
+    query_filter = None
+    if slot:
+        query_filter = Filter(must=[
+            FieldCondition(key="slot", match=MatchValue(value=slot))
+        ])
+
+    # Overfetch enough to absorb the exclude_ids drop.
+    pool_size = max(k * 3, k + len(exclude_ids) + 5)
+    hits = qclient.query_points(
+        collection_name=QDRANT_COLLECTION,
+        query=target_emb.detach().cpu().squeeze().tolist(),
+        query_filter=query_filter,
+        limit=pool_size,
+    ).points
 
     results = []
-    for idx in order.tolist():
-        if db_ids[idx] in exclude_ids:
+    for hit in hits:
+        item_id = hit.payload["item_id"]
+        if item_id in exclude_ids:
             continue
-        if require_keyword and require_keyword.lower() not in db_categories[idx]:
+        img = get_item_image(item_id)
+        if img is None:
             continue
-        results.append((db_images[idx], db_ids[idx]))
+        results.append((img, item_id))
         if len(results) >= k:
             break
-
-    if not results:  # fallback ignoring keyword
-        for idx in order[:k].tolist():
-            results.append((db_images[idx], db_ids[idx]))
     return results
 
 
-def map_to_blueprint(raw_cat: str) -> str:
-    c = raw_cat.lower()
-    rules = [
-        (["shirt", "top", "blouse", "t-shirt", "sweater", "hoodie", "camisole", "knit"], "tops"),
-        (["pant", "jean", "skirt", "bottom", "short", "legging", "trouser"], "bottoms"),
-        (["shoe", "sneaker", "boot", "heel", "sandal", "flat", "wedge"], "shoes"),
-        (["bag", "purse", "tote", "backpack", "clutch", "satchel"], "bags"),
-        (["jacket", "coat", "outer", "blazer", "cardigan", "vest"], "outerwear"),
-        (["dress", "gown", "romper"], "dresses"),
-        (["jewelry", "necklace", "ring", "earring", "bracelet", "watch"], "jewelry"),
-        (["hat", "cap", "beanie"], "hats"),
-    ]
-    for keywords, label in rules:
-        if any(k in c for k in keywords):
-            return label
-    return "accessories"
+def slot_of(item_id: str, qclient) -> str:
+    """Look up the SigLIP-classified slot of a given item from Qdrant payload."""
+    res = qclient.scroll(
+        collection_name=QDRANT_COLLECTION,
+        scroll_filter=Filter(must=[FieldCondition(key="item_id", match=MatchValue(value=item_id))]),
+        limit=1,
+        with_payload=True,
+    )
+    points, _ = res
+    if not points:
+        return "accessories"
+    return points[0].payload.get("slot", "accessories")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -308,11 +339,17 @@ with st.spinner("Loading model and vector index…"):
 
 model = A["model"]
 embeddings = A["embeddings"]
-db_features = A["db_features"]
-db_categories = A["db_categories"]
-db_images = A["db_images"]
-db_ids = A["db_ids"]
+qclient = A["qclient"]
+id_to_row = A["id_to_row"]
+db_count = A["db_count"]
 device = A["device"]
+
+@st.cache_resource(show_spinner=False)
+def usable_item_ids():
+    """Items that have both an embedding and a polyvore image."""
+    return [iid for iid in embeddings.keys() if iid in id_to_row]
+
+ALL_IDS = usable_item_ids()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Sidebar — controls
@@ -320,39 +357,38 @@ device = A["device"]
 with st.sidebar:
     st.markdown("### Seed")
     if "seed_idx" not in st.session_state:
-        st.session_state.seed_idx = random.randint(0, len(db_ids) - 1)
+        st.session_state.seed_idx = random.randint(0, len(ALL_IDS) - 1)
 
     if st.button("Shuffle seed", width="stretch"):
-        st.session_state.seed_idx = random.randint(0, len(db_ids) - 1)
+        st.session_state.seed_idx = random.randint(0, len(ALL_IDS) - 1)
 
     st.session_state.seed_idx = st.number_input(
-        f"Seed index (0 – {len(db_ids) - 1})",
+        f"Seed index (0 – {len(ALL_IDS) - 1})",
         min_value=0,
-        max_value=len(db_ids) - 1,
+        max_value=len(ALL_IDS) - 1,
         value=st.session_state.seed_idx,
         step=1,
     )
 
     seed_idx = st.session_state.seed_idx
-    seed_item_id = db_ids[seed_idx]
-    seed_img = db_images[seed_idx]
-    seed_raw_cat = db_categories[seed_idx]
-    mapped_seed_cat = map_to_blueprint(seed_raw_cat)
+    seed_item_id = ALL_IDS[seed_idx]
+    seed_img = get_item_image(seed_item_id)
+    mapped_seed_cat = slot_of(seed_item_id, qclient)
 
     st.markdown("### Blueprint")
     st.caption(f"Seed detected as **{mapped_seed_cat}** · incompatible slots auto-hidden.")
 
     blocked = INCOMPATIBLE_SLOTS.get(mapped_seed_cat, {mapped_seed_cat})
-    allowed_categories = [c for c in AVAILABLE_CATEGORIES if c not in blocked]
+    allowed_slots = [c for c in AVAILABLE_SLOTS if c not in blocked]
 
-    if mapped_seed_cat == "dresses":
-        blueprint = [c for c in DRESS_BLUEPRINT if c in allowed_categories]
+    if mapped_seed_cat in ("dresses", "one-piece"):
+        blueprint = [c for c in DRESS_BLUEPRINT if c in allowed_slots]
     else:
-        blueprint = [c for c in DEFAULT_BLUEPRINT if c in allowed_categories]
+        blueprint = [c for c in DEFAULT_BLUEPRINT if c in allowed_slots]
 
     queries = st.multiselect(
         "Components to generate",
-        options=allowed_categories,
+        options=allowed_slots,
         default=blueprint,
     )
 
@@ -365,7 +401,7 @@ with st.sidebar:
 
     st.divider()
     st.caption(f"Checkpoint: `{A['ckpt']}`")
-    st.caption(f"Device: `{device}` · DB: `{len(db_ids):,}` items")
+    st.caption(f"Device: `{device}` · DB: `{db_count:,}` items (Qdrant)")
 
 if not queries:
     st.warning("Select at least one component in the sidebar.")
@@ -412,9 +448,9 @@ with st.spinner("Composing outfits…"):
         [embeddings[seed_item_id]["text"].unsqueeze(0)],
         first_query,
     )
-    first_candidates = search_top_k(
-        first_ideal, db_features, db_categories, db_images, db_ids,
-        require_keyword=first_query, k=max(num_outfits, top_k),
+    first_candidates = qdrant_search(
+        qclient, first_ideal,
+        slot=first_query, k=max(num_outfits, top_k),
         exclude_ids={seed_item_id},
     )
 
@@ -439,9 +475,9 @@ with st.spinner("Composing outfits…"):
         # Remaining slots: greedy rank-1
         for query in queries[1:]:
             ideal = predict_next(ctx_imgs, ctx_txts, query)
-            results = search_top_k(
-                ideal, db_features, db_categories, db_images, db_ids,
-                require_keyword=query, k=top_k, exclude_ids=used,
+            results = qdrant_search(
+                qclient, ideal,
+                slot=query, k=top_k, exclude_ids=used,
             )
             best_img, best_id = results[0]
             score = cosine_score(ideal, best_id)

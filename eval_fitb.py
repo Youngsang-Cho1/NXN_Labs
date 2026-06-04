@@ -14,15 +14,33 @@ def main():
                         choices=["nondisjoint", "disjoint"],
                         help="Polyvore split (disjoint = items don't overlap between train/test)")
     parser.add_argument("--num_samples", type=int, default=10000, help="Number of FITB questions to eval")
+    parser.add_argument("--no_context_text", action="store_true",
+                        help="Disable context text in eval. Auto-set from checkpoint hparams if available.")
     args = parser.parse_args()
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     print(f" Using Device: {device}")
 
     # 1. Load Model
-    model = OutfitTransformer(num_layers=args.num_layers).to(device)
+    num_layers = args.num_layers
+    state_dict = None
     if os.path.exists(args.model_path):
-        model.load_state_dict(torch.load(args.model_path, weights_only=True, map_location=device), strict=False)
+        ckpt = torch.load(args.model_path, weights_only=True, map_location=device)
+        if isinstance(ckpt, dict) and "state_dict" in ckpt:
+            state_dict = ckpt["state_dict"]
+            hparams = ckpt.get("hparams", {})
+            if "num_layers" in hparams:
+                num_layers = hparams["num_layers"]
+                print(f"📐 Using num_layers={num_layers} from checkpoint hparams")
+            if hparams.get("no_context_text", False) and not args.no_context_text:
+                args.no_context_text = True
+                print(f"📐 Auto-enabling --no_context_text from checkpoint hparams")
+        else:
+            state_dict = ckpt
+
+    model = OutfitTransformer(num_layers=num_layers).to(device)
+    if state_dict is not None:
+        model.load_state_dict(state_dict, strict=False)
         print(f"✅ Loaded weights from {args.model_path}")
     else:
         print(f"⚠️  No checkpoint found at {args.model_path}, using random weights.")
@@ -69,7 +87,7 @@ def main():
         if idx is None: return None
         return polyvore_items[idx]
         
-    print("\n Running Fill-In-The-Blank (FITB) Evaluation Benchmark (500 Questions)...")
+    print(f"\n Running Fill-In-The-Blank (FITB) Evaluation Benchmark ({len(fitb_test)} Questions)...")
     
     progress_bar = tqdm(fitb_test)
     for row in progress_bar:
@@ -100,6 +118,8 @@ def main():
         context_texts_tensor = (
             torch.stack(context_txt_tensors, dim=1).to(device) if context_txt_tensors else None
         )
+        if args.no_context_text:
+            context_texts_tensor = None
 
         # Pure-visual FITB: no target text hint, but context text is available.
         with torch.no_grad():

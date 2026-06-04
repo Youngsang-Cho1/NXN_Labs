@@ -3,13 +3,21 @@ from torch.utils.data import Dataset
 import random
 
 class OutfitRetrievalDataset(Dataset):
-    def __init__(self, outfit_dataset, items_dataset, transform=None, embeddings_dict=None, num_negatives=5, max_outfit_size=8):
+    def __init__(self, outfit_dataset, items_dataset, transform=None, embeddings_dict=None,
+                 num_negatives=5, max_outfit_size=8, neg_strategy="midsim"):
+        """
+        neg_strategy:
+          - "midsim": same-category items in the 10–40 percentile similarity band (default)
+          - "topk":   same-category items with the highest similarity (ablation: tests
+                     whether mid-sim mining actually helps vs naive top-K)
+        """
         self.outfit_dataset = outfit_dataset
         self.items_dataset = items_dataset
         self.transform = transform
         self.embeddings_dict = embeddings_dict
         self.num_negatives = num_negatives
         self.max_outfit_size = max_outfit_size
+        self.neg_strategy = neg_strategy
         
         print("Building item_id to index lookup and category maps...")
         self.item_idx_map = {}
@@ -107,10 +115,15 @@ class OutfitRetrievalDataset(Dataset):
             sims = torch.matmul(candidate_embs, target_emb)
 
             sorted_idx = torch.argsort(sims, descending=True)
-            lo = int(0.10 * len(sorted_idx))
-            hi = int(0.40 * len(sorted_idx))
-            band = sorted_idx[lo:hi] if hi - lo >= self.num_negatives else sorted_idx[:self.num_negatives]
-            chosen = band[torch.randperm(len(band))[:self.num_negatives]]
+            if self.neg_strategy == "topk":
+                # Ablation: pick the MOST similar items as negatives (naive hard neg)
+                chosen = sorted_idx[:self.num_negatives]
+            else:
+                # Default: mid-similarity band (10-40 percentile)
+                lo = int(0.10 * len(sorted_idx))
+                hi = int(0.40 * len(sorted_idx))
+                band = sorted_idx[lo:hi] if hi - lo >= self.num_negatives else sorted_idx[:self.num_negatives]
+                chosen = band[torch.randperm(len(band))[:self.num_negatives]]
             hard_negative_ids = [pool_ids[i] for i in chosen.tolist()]
 
             for neg_id in hard_negative_ids:
